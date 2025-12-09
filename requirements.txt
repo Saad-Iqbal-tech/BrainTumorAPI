@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+numpy
+opencv-python
+tensorflow
+pillow
+requests
+firebase-admin
+python-multipart
