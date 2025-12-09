@@ -1,24 +1,25 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Depends
-from firebase_admin import auth, initialize_app, credentials
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header
 import cv2
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import load_model
 import requests
+from tensorflow.keras.models import load_model
+from middleware import setup_cors
 import os
 import hashlib
+import firebase_admin
+from firebase_admin import credentials, auth
 
 app = FastAPI()
+setup_cors(app)
 
-FIREBASE_KEY_PATH = os.getenv("FIREBASE_KEY_PATH", "serviceAccountKey.json")
-MODEL_URL = os.getenv("MODEL_URL", "https://github.com/Saad-Iqbal-tech/BrainTumorAPI/releases/download/Tag/vgg16_brain_model.h5")
-MODEL_FILE = os.getenv("MODEL_FILE", "vgg16_brain_model.h5")
-MODEL_SHA256 = os.getenv("MODEL_SHA256", "96b84020c0dbe3bff47d5ced16ab99e277978023d1e7f41c8c83e78565b22f52")
+MODEL_URL = "https://github.com/Saad-Iqbal-tech/BrainTumorAPI/releases/download/Tag/vgg16_brain_model.h5"
+MODEL_FILE = "vgg16_brain_model.h5"
+MODEL_SHA256 = "96b84020c0dbe3bff47d5ced16ab99e277978023d1e7f41c8c83e78565b22f52"
 IMG_SIZE = (256, 256)
 class_names = ["notumor", "tumor"]
 
-cred = credentials.Certificate(FIREBASE_KEY_PATH)
-initialize_app(cred)
+cred = credentials.Certificate(os.environ.get("FIREBASE_ADMIN_KEY_PATH"))
+firebase_admin.initialize_app(cred)
 
 def file_sha256(path):
     sha = hashlib.sha256()
@@ -74,40 +75,35 @@ def preprocess_image(file_bytes):
     else:
         brain_crop = gray
     brain_crop = cv2.resize(brain_crop, IMG_SIZE)
+    brain_crop = brain_crop.astype(np.float32)
     brain_crop = cv2.cvtColor(brain_crop, cv2.COLOR_GRAY2RGB)
-    brain_crop = brain_crop.astype(np.float32) / 255.0
+    brain_crop = brain_crop / 255.0
     brain_crop = np.expand_dims(brain_crop, axis=0)
     return brain_crop
 
-def verify_token(authorization: str = Header(...)):
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header")
-    id_token = authorization.split("Bearer ")[1]
+def verify_token(id_token: str):
     try:
         decoded_token = auth.verify_id_token(id_token)
-        return decoded_token
+        return decoded_token["uid"]
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-@app.post("/signup/")
-def signup(email: str, password: str):
-    try:
-        user = auth.create_user(email=email, password=password)
-        return {"message": "User created successfully", "uid": user.uid}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...), user=Depends(verify_token)):
+async def predict(file: UploadFile = File(...), authorization: str = Header(...)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File is not an image")
+
+    token = authorization.replace("Bearer ", "")
+    user_id = verify_token(token)
+
     content = await file.read()
     img_preprocessed = preprocess_image(content)
     preds = model.predict(img_preprocessed)[0][0]
     pred_class = "tumor" if preds >= 0.5 else "notumor"
     confidence = float(preds) if pred_class == "tumor" else 1 - float(preds)
+
     return {
+        "user_id": user_id,
         "predicted_class": pred_class,
-        "confidence": confidence,
-        "user_email": user["email"]
+        "confidence": confidence
     }
