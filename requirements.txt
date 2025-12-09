@@ -1,9 +1,10 @@
 fastapi
 uvicorn
 numpy
-opencv-python
+opencv-python-headless
 tensorflow
 pillow
 requests
 firebase-admin
 python-multipart
+
