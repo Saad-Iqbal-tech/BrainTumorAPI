@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+firebase-admin
+pydantic
+python-multipart
+requests
+
+
+tensorflow
+numpy
+opencv-python
+
+
