@@ -4,28 +4,44 @@ import cv2
 import numpy as np
 import requests
 from tensorflow.keras.models import load_model
-from middleware import setup_cors
 import os
 import hashlib
 import firebase_admin
 from firebase_admin import credentials, auth, firestore
+from middleware import setup_cors
+from datetime import datetime
 
 app = FastAPI()
 setup_cors(app)
 
-# ------------------------- Model Setup -------------------------
+# Model info
 MODEL_URL = "https://github.com/Saad-Iqbal-tech/BrainTumorAPI/releases/download/Tag/vgg16_brain_model.h5"
 MODEL_FILE = "vgg16_brain_model.h5"
 MODEL_SHA256 = "96b84020c0dbe3bff47d5ced16ab99e277978023d1e7f41c8c83e78565b22f52"
 IMG_SIZE = (256, 256)
+
+# Initialize Firebase
+cred = credentials.Certificate(os.environ.get("FIREBASE_ADMIN_KEY_PATH"))
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
 class_names = ["notumor", "tumor"]
 
+# Pydantic model for profile
+class Profile(BaseModel):
+    name: str
+    age: int
+    gender: str
+    phone: str
+
+# SHA256 checksum
 def file_sha256(path):
     sha = hashlib.sha256()
     with open(path, "rb") as f:
         sha.update(f.read())
     return sha.hexdigest()
 
+# Download model if missing or corrupted
 def download_model():
     if os.path.exists(MODEL_FILE):
         if file_sha256(MODEL_FILE) == MODEL_SHA256:
@@ -43,6 +59,7 @@ def download_model():
 download_model()
 model = load_model(MODEL_FILE)
 
+# Image preprocessing
 def preprocess_image(file_bytes):
     file_bytes = np.frombuffer(file_bytes, np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -80,11 +97,7 @@ def preprocess_image(file_bytes):
     brain_crop = np.expand_dims(brain_crop, axis=0)
     return brain_crop
 
-# ------------------------- Firebase Setup -------------------------
-cred = credentials.Certificate(os.environ.get("FIREBASE_ADMIN_KEY_PATH"))
-firebase_admin.initialize_app(cred)
-db = firestore.client()
-
+# Verify Firebase token
 def verify_token(id_token: str):
     try:
         decoded_token = auth.verify_id_token(id_token)
@@ -92,52 +105,47 @@ def verify_token(id_token: str):
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid authentication token")
 
-# ------------------------- Pydantic Models -------------------------
-class ProfileModel(BaseModel):
-    name: str
-    age: int
-    gender: str
-    phone: str
-
-# ------------------------- Profile Endpoints -------------------------
-@app.get("/profile")
-def get_profile(authorization: str = Header(...)):
-    uid = verify_token(authorization.replace("Bearer ", ""))
-    doc_ref = db.collection("users").document(uid)
-    doc = doc_ref.get()
-    if doc.exists:
-        return {"exists": True, **doc.to_dict()}
-    else:
-        return {"exists": False}
-
+# ---------------- Profile Endpoints ----------------
 @app.post("/profile")
-def save_profile(profile: ProfileModel, authorization: str = Header(...)):
-    uid = verify_token(authorization.replace("Bearer ", ""))
-    doc_ref = db.collection("users").document(uid)
-    doc_ref.set(profile.dict())
-    return {"message": "Profile saved successfully"}
+async def save_profile(profile: Profile, authorization: str = Header(...)):
+    token = authorization.replace("Bearer ", "")
+    uid = verify_token(token)
+    user_ref = db.collection("users").document(uid)
+    user_ref.set(profile.dict(), merge=True)
+    return {"message":"Profile saved successfully!"}
 
-# ------------------------- Prediction Endpoint -------------------------
+@app.get("/profile")
+async def get_profile(authorization: str = Header(...)):
+    token = authorization.replace("Bearer ", "")
+    uid = verify_token(token)
+    doc = db.collection("users").document(uid).get()
+    if doc.exists:
+        return {"exists": True, "data": doc.to_dict()}
+    return {"exists": False}
+
+# ---------------- Prediction Endpoint ----------------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...), authorization: str = Header(...)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File is not an image")
 
     token = authorization.replace("Bearer ", "")
-    user_id = verify_token(token)
+    uid = verify_token(token)
 
     content = await file.read()
     img_preprocessed = preprocess_image(content)
     preds = model.predict(img_preprocessed)[0][0]
     pred_class = "tumor" if preds >= 0.5 else "notumor"
-    confidence = float(preds) if pred_class == "tumor" else 1 - float(preds)
+    confidence = float(preds) if pred_class=="tumor" else 1-float(preds)
 
-    # Save report in Firestore
-    user_doc = db.collection("users").document(user_id).get()
-    patient_name = user_doc.to_dict().get("name", "Unknown")
+    # Get patient info from user profile
+    doc = db.collection("users").document(uid).get()
+    patient_name = doc.to_dict().get("name","Unknown") if doc.exists else "Unknown"
+
+    # Save report
     report_ref = db.collection("reports").document()
     report_ref.set({
-        "user_id": user_id,
+        "user_id": uid,
         "patient_name": patient_name,
         "prediction": pred_class,
         "confidence": confidence,
@@ -145,7 +153,17 @@ async def predict(file: UploadFile = File(...), authorization: str = Header(...)
     })
 
     return {
-        "user_id": user_id,
+        "user_id": uid,
         "predicted_class": pred_class,
-        "confidence": confidence
+        "confidence": confidence,
+        "patient_name": patient_name
     }
+
+# ---------------- Reports Endpoint ----------------
+@app.get("/reports")
+async def get_reports(authorization: str = Header(...)):
+    token = authorization.replace("Bearer ", "")
+    uid = verify_token(token)
+    reports_ref = db.collection("reports").where("user_id","==",uid).order_by("created_at","desc")
+    reports = [doc.to_dict() for doc in reports_ref.stream()]
+    return {"reports": reports}
