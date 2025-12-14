@@ -7,7 +7,8 @@ from middleware import setup_cors
 import os
 import hashlib
 import firebase_admin
-from firebase_admin import credentials, auth
+from firebase_admin import credentials, auth, firestore
+from datetime import datetime
 
 app = FastAPI()
 setup_cors(app)
@@ -18,8 +19,10 @@ MODEL_SHA256 = "96b84020c0dbe3bff47d5ced16ab99e277978023d1e7f41c8c83e78565b22f52
 IMG_SIZE = (256, 256)
 class_names = ["notumor", "tumor"]
 
+# Initialize Firebase
 cred = credentials.Certificate(os.environ.get("FIREBASE_ADMIN_KEY_PATH"))
 firebase_admin.initialize_app(cred)
+db = firestore.client()  # Firestore for users & reports
 
 def file_sha256(path):
     sha = hashlib.sha256()
@@ -82,28 +85,74 @@ def preprocess_image(file_bytes):
     return brain_crop
 
 def verify_token(id_token: str):
+    """Verify Firebase token and return UID"""
     try:
         decoded_token = auth.verify_id_token(id_token)
         return decoded_token["uid"]
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid authentication token")
 
+# --- Profile endpoints ---
+@app.post("/profile")
+def save_profile(data: dict, authorization: str = Header(...)):
+    """Save dashboard form data to Firestore"""
+    token = authorization.replace("Bearer ", "")
+    uid = verify_token(token)
+    # Save in users collection
+    db.collection("users").document(uid).set({
+        "name": data.get("name", ""),
+        "age": data.get("age", ""),
+        "gender": data.get("gender", ""),
+        "phone": data.get("phone", "")
+    })
+    return {"message": "Profile saved successfully"}
+
+@app.get("/profile")
+def get_profile(authorization: str = Header(...)):
+    """Return profile info for dashboard form"""
+    token = authorization.replace("Bearer ", "")
+    uid = verify_token(token)
+    doc = db.collection("users").document(uid).get()
+    if not doc.exists:
+        return {"exists": False}
+    return {"exists": True, "data": doc.to_dict()}
+
+# --- Prediction endpoint ---
 @app.post("/predict")
 async def predict(file: UploadFile = File(...), authorization: str = Header(...)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File is not an image")
 
     token = authorization.replace("Bearer ", "")
-    user_id = verify_token(token)
+    uid = verify_token(token)
 
+    # Preprocess and predict
     content = await file.read()
     img_preprocessed = preprocess_image(content)
     preds = model.predict(img_preprocessed)[0][0]
     pred_class = "tumor" if preds >= 0.5 else "notumor"
     confidence = float(preds) if pred_class == "tumor" else 1 - float(preds)
 
+    # Get user name for report
+    user_doc = db.collection("users").document(uid).get()
+    if not user_doc.exists:
+        raise HTTPException(status_code=400, detail="User profile not completed")
+    user_data = user_doc.to_dict()
+    patient_name = user_data.get("name", "Unknown")
+
+    # Save report in Firestore
+    report_data = {
+        "user_id": uid,
+        "patient_name": patient_name,
+        "prediction": pred_class,
+        "confidence": confidence,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    db.collection("reports").add(report_data)
+
     return {
-        "user_id": user_id,
+        "patient_name": patient_name,
         "predicted_class": pred_class,
         "confidence": confidence
     }
+
